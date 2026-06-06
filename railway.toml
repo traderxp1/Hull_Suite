@@ -1,0 +1,2 @@
+[deploy]
+startCommand = "gunicorn --bind 0.0.0.0:${PORT:-8080} --worker-class gthread --workers 1 --threads 8 --timeout 60 --keep-alive 5 main:app"
