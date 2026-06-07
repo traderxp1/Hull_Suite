@@ -524,19 +524,44 @@ def log_signal_event(symbol, action, status="", reason="", data=None):
         log.error(f"فشل حفظ الإشارة: {e}")
 
 # ====================================================================
-def create_client_with_retry(max_retries=5, delay=3):
+def create_client_with_retry(max_retries=2, delay=2):
+    """Create Binance client safely.
+    V3: Railway/Binance may block the hosting IP by region. The web app must not crash
+    at startup; it should stay online and show the dashboard/log rejected signals.
+    """
+    if not API_KEY or not API_SECRET:
+        log.warning("⚠️ Binance keys missing; running dashboard/webhook in broker-offline mode")
+        return None
     for i in range(max_retries):
         try:
             c = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
+            # force a lightweight request so restricted-region errors are detected early
+            c.get_account()
             log.info("✅ اتصل ببايننس")
             return c
         except Exception as e:
-            log.warning(f"⚠️ محاولة {i+1}: {e}")
+            log.warning(f"⚠️ Binance connect attempt {i+1}: {e}")
             if i < max_retries - 1:
                 time_module.sleep(delay)
-    raise Exception("Cannot connect to Binance")
+    log.error("❌ Binance unavailable; keeping Flask alive instead of crashing")
+    return None
 
 client = create_client_with_retry()
+BINANCE_OFFLINE_REASON = "Binance API unavailable/restricted from this Railway location" if client is None else ""
+
+def ensure_binance_client():
+    """Lazy reconnect. Returns True only when Binance is reachable."""
+    global client, BINANCE_OFFLINE_REASON
+    if client is not None:
+        return True
+    c = create_client_with_retry(max_retries=1, delay=0)
+    if c is not None:
+        client = c
+        BINANCE_OFFLINE_REASON = ""
+        return True
+    BINANCE_OFFLINE_REASON = "Binance API unavailable/restricted from this Railway location"
+    return False
+
 state_lock = threading.Lock()
 
 # ====================================================================
@@ -599,6 +624,8 @@ def is_duplicate(data):
 def get_symbol_filters(symbol):
     if symbol in symbol_info_cache:
         return symbol_info_cache[symbol]
+    if not ensure_binance_client():
+        return {}
     try:
         info = client.get_symbol_info(symbol)
         f = {}
@@ -819,6 +846,8 @@ PRICE_CACHE_TTL = env_float("PRICE_CACHE_TTL", 0.8)  # ثانية
 
 def _refresh_price_cache():
     global _price_cache, _price_cache_ts
+    if not ensure_binance_client():
+        return
     try:
         tickers = client.get_all_tickers()
         with _price_cache_lock:
@@ -1542,6 +1571,11 @@ def monitor_pending_orders():
 def process_signal_task(data, action):
     try:
         log.info(f"معالجة في الخلفية: {json.dumps(data)}")
+        # V3: if Binance blocks Railway IP, do not crash and do not attempt unsafe orders.
+        if not ensure_binance_client():
+            r = {"status": "rejected", "reason": BINANCE_OFFLINE_REASON}
+            log_signal_event(data.get("symbol"), action, r["status"], r["reason"], data)
+            return
         if action == "ENTRY":
             r = handle_entry(data)
         elif action in ("PLACE_BUY_STOP", "PENDING_ENTRY", "BUY_STOP"):
