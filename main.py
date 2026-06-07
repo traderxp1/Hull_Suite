@@ -193,6 +193,7 @@ def _apply_bot_settings():
         MONITOR_INTERVAL_SEC = _bot_float(cfg.get("monitor"), MONITOR_INTERVAL_SEC)
     if "pending_expiry" in cfg:
         PENDING_MAX_AGE_MIN = _bot_float(cfg.get("pending_expiry"), PENDING_MAX_AGE_MIN)
+        globals()["UNPROTECTED_GRACE_SEC"] = _bot_float(cfg.get("unprotected_grace"), globals().get("UNPROTECTED_GRACE_SEC", 20))
 
 
     if "reconcile" in cfg:
@@ -263,7 +264,7 @@ def init_db():
                         initial_sl_price FLOAT,
                         current_sl_price FLOAT,
                         tp_price FLOAT,
-                        exit_reason VARCHAR(20),
+                        exit_reason TEXT,
                         qty FLOAT,
                         pnl FLOAT,
                         pnl_pct FLOAT,
@@ -283,8 +284,8 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         received_at TIMESTAMP DEFAULT NOW(),
                         symbol VARCHAR(20),
-                        action VARCHAR(40),
-                        status VARCHAR(40),
+                        action TEXT,
+                        status TEXT,
                         reason TEXT,
                         entry_price FLOAT,
                         sl_price FLOAT,
@@ -302,7 +303,7 @@ def init_db():
                         id SERIAL PRIMARY KEY,
                         created_at TIMESTAMP DEFAULT NOW(),
                         symbol VARCHAR(20),
-                        action VARCHAR(60),
+                        action TEXT,
                         details TEXT
                     )
                 """)
@@ -319,7 +320,7 @@ def init_db():
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS initial_sl_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS current_sl_price FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_price FLOAT")
-                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason VARCHAR(20)")
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS qty FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT")
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl_pct FLOAT")
@@ -331,8 +332,8 @@ def init_db():
 
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMP DEFAULT NOW()")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
-                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS action VARCHAR(40)")
-                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS status VARCHAR(40)")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS action TEXT")
+                cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS status TEXT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS reason TEXT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS entry_price FLOAT")
                 cur.execute("ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS sl_price FLOAT")
@@ -344,8 +345,15 @@ def init_db():
 
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS symbol VARCHAR(20)")
-                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS action VARCHAR(60)")
+                cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS action TEXT")
                 cur.execute("ALTER TABLE action_events ADD COLUMN IF NOT EXISTS details TEXT")
+
+                # V4/V29 DB SAFE: old tables may still be VARCHAR(20/40/60).
+                # Convert text fields so long guard/reconcile reasons never crash saving.
+                cur.execute("ALTER TABLE trades ALTER COLUMN exit_reason TYPE TEXT")
+                cur.execute("ALTER TABLE signal_events ALTER COLUMN action TYPE TEXT")
+                cur.execute("ALTER TABLE signal_events ALTER COLUMN status TYPE TEXT")
+                cur.execute("ALTER TABLE action_events ALTER COLUMN action TYPE TEXT")
             conn.commit()
         log.info("✅ قاعدة البيانات جاهزة")
     except Exception as e:
@@ -358,6 +366,7 @@ def save_trade(symbol, entry, exit_price, exit_reason, qty, pnl, sl=None, tp=Non
     Older trades may not have these fields, so we keep sl_price as initial SL for compatibility.
     """
     try:
+        exit_reason = str(exit_reason or "UNKNOWN")
         initial_sl = sl
         pnl_pct = round((pnl / (entry * qty)) * 100, 4) if entry and qty and entry * qty > 0 else None
         risk = entry - initial_sl if initial_sl and entry else None
@@ -1410,6 +1419,11 @@ def broker_reconcile_once():
 
             # Binance spot OCO locks the base asset. When OCO fills, open orders normally disappear.
             # If no open order remains, decide whether this is flat/closed or naked/unprotected.
+            if len(open_orders) != 0 and st.get("unprotected_seen_ts"):
+                with state_lock:
+                    s = get_state(symbol)
+                    s.pop("unprotected_seen_ts", None)
+                    save_state(symbol, s)
             if len(open_orders) == 0:
                 free_base = get_available_balance(symbol)
 
@@ -1689,11 +1703,28 @@ def reset_symbol_route(symbol):
 def trade_dt(t, key):
     return safe_dt(t.get(key))
 
+
+def _reason_key(r):
+    return str(r or "").upper()
+
+def _is_tp_reason(r):
+    return _reason_key(r) in ("TP", "GUARD_TP", "TP_RECONCILE")
+
+def _is_be_reason(r):
+    return _reason_key(r) in ("BE", "SL_MARKET", "BE_MARKET")
+
+def _is_sl_reason(r):
+    return _reason_key(r) in (
+        "SL", "GUARD_SL", "SL_RECONCILE", "RECONCILE_UNPROTECTED_CLOSE",
+        "NO_BROKER_PROTECTION", "BE_PROTECTION_FAILED", "BE_CANCEL_FAILED",
+        "PROTECTION_FAILED", "EXECUTION_ERROR"
+    )
+
 def reason_ar(r):
-    if r == "TP": return "✅ تيك بروفت"
-    if r in ("BE", "SL_MARKET"): return "➡️ بريك ايفن"
-    if r == "SL": return "❌ ستوب لوز"
-    if r == "CANCEL_PENDING": return "🚫 إلغاء انتظار"
+    if _is_tp_reason(r): return "✅ تيك بروفت"
+    if _is_be_reason(r): return "➡️ بريك ايفن"
+    if _is_sl_reason(r): return "❌ ستوب/حارس"
+    if _reason_key(r) == "CANCEL_PENDING": return "🚫 إلغاء انتظار"
     return r or "—"
 
 def calc_trade_metrics(trades):
@@ -1701,9 +1732,9 @@ def calc_trade_metrics(trades):
     total_pnl = sum(float(t.get("pnl") or 0) for t in trades)
     wins = [t for t in trades if float(t.get("pnl") or 0) > 0]
     losses = [t for t in trades if float(t.get("pnl") or 0) < 0]
-    tp = [t for t in trades if t.get("exit_reason") == "TP"]
-    be = [t for t in trades if t.get("exit_reason") in ("BE", "SL_MARKET")]
-    sl = [t for t in trades if t.get("exit_reason") == "SL"]
+    tp = [t for t in trades if _is_tp_reason(t.get("exit_reason"))]
+    be = [t for t in trades if _is_be_reason(t.get("exit_reason"))]
+    sl = [t for t in trades if _is_sl_reason(t.get("exit_reason"))]
     gross_profit = sum(float(t.get("pnl") or 0) for t in wins)
     gross_loss = abs(sum(float(t.get("pnl") or 0) for t in losses))
     rr_values = [float(t.get("rr_actual")) for t in trades if t.get("rr_actual") is not None]
