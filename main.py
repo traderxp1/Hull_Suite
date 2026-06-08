@@ -1,9 +1,11 @@
 """
-Hull Suite Binance Bot - V1 (Based on V28 FINAL AUDITED) (V27 + pending TTL + no zero-qty liquidation)
+Hull Suite Binance Bot - V5 REPLACE PENDING NO EXPIRY
 + قاعدة بيانات PostgreSQL كاملة
 + داشبورد تحليلي شامل
 + FINAL: Pending-only entry, no market fallback, OCO after fill
 """
+
+# V32: net filter default OFF. New signals replace old pending. No pending expiry.
 
 import os
 import logging
@@ -42,7 +44,7 @@ def env_float(name, default):
     except Exception:
         return float(default)
 
-NET_FILTER_ENABLED = os.environ.get("NET_FILTER_ENABLED", "true").lower() == "true"
+NET_FILTER_ENABLED = os.environ.get("NET_FILTER_ENABLED", "false").lower() == "true"
 MIN_RISK_PCT       = env_float("MIN_RISK_PCT", 0.20)       # percent of entry price
 MIN_NET_RR         = env_float("MIN_NET_RR", 1.20)         # net profit / net loss minimum
 FEE_RATE_PER_SIDE  = env_float("FEE_RATE_PER_SIDE", 0.001) # decimal: 0.001 = 0.10% per side
@@ -88,8 +90,6 @@ BOT_BE_TRIGGER_R = env_float("BOT_BE_TRIGGER_R", 0.30)
 BOT_BE_LOCK_R = env_float("BOT_BE_LOCK_R", 0.00)
 BOT_BE_UPDATE_BROKER = os.environ.get("BOT_BE_UPDATE_BROKER", "true").lower() == "true"
 MONITOR_INTERVAL_SEC = env_float("MONITOR_INTERVAL_SEC", 1.0)
-# V28: safety expiry for broker pending orders if TradingView CANCEL is missed. 0 = disabled.
-PENDING_MAX_AGE_MIN = env_float("PENDING_MAX_AGE_MIN", 180.0)
 
 # V20 FINAL HARDENED: broker reconcile checks the broker itself, not only bot memory.
 BROKER_RECONCILE_ENABLED = os.environ.get("BROKER_RECONCILE_ENABLED", "true").lower() == "true"
@@ -138,7 +138,7 @@ def _apply_bot_settings():
     global BROKER_PROTECTION_MODE, REQUIRE_BROKER_PROTECTION, OCO_STOP_LIMIT_BUFFER_PCT
     global BACKTEST_MIRROR_MODE, MAX_ENTRY_DEVIATION_PCT, REJECT_IF_PRICE_BEYOND_SL_TP, MIRROR_REJECT_IF_NO_PRICE
     global PENDING_ONLY_ENTRY, REJECT_IF_ENTRY_ALREADY_PASSED, NEAR_ENTRY_TOLERANCE_PCT
-    global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC, PENDING_MAX_AGE_MIN
+    global BOT_BE_ENABLED, BOT_BE_TRIGGER_R, BOT_BE_LOCK_R, BOT_BE_UPDATE_BROKER, MONITOR_INTERVAL_SEC
     global BROKER_RECONCILE_ENABLED, RECONCILE_UNPROTECTED_ACTION, EXECUTION_ERROR_R_THRESHOLD
     cfg = _load_bot_settings()
     if not cfg:
@@ -191,9 +191,6 @@ def _apply_bot_settings():
         BOT_BE_UPDATE_BROKER = _bot_bool(cfg.get("be_update"), BOT_BE_UPDATE_BROKER)
     if "monitor" in cfg:
         MONITOR_INTERVAL_SEC = _bot_float(cfg.get("monitor"), MONITOR_INTERVAL_SEC)
-    if "pending_expiry" in cfg:
-        PENDING_MAX_AGE_MIN = _bot_float(cfg.get("pending_expiry"), PENDING_MAX_AGE_MIN)
-        globals()["UNPROTECTED_GRACE_SEC"] = _bot_float(cfg.get("unprotected_grace"), globals().get("UNPROTECTED_GRACE_SEC", 20))
 
 
     if "reconcile" in cfg:
@@ -825,6 +822,23 @@ def get_available_balance(symbol):
     except BinanceAPIException:
         return 0.0
 
+def get_balance_parts(symbol):
+    """Return Binance free/locked/total balance for the base asset.
+
+    OCO/stop orders can lock the coin. The bot must NOT mark a trade
+    as BROKER_FLAT just because free balance is zero while locked balance exists.
+    """
+    base_asset = symbol.replace("USDT", "").replace("BUSD", "").replace("FDUSD", "")
+    try:
+        bal = client.get_asset_balance(asset=base_asset)
+        if not bal:
+            return {"free": 0.0, "locked": 0.0, "total": 0.0}
+        free = safe_float(bal.get("free"), 0.0) or 0.0
+        locked = safe_float(bal.get("locked"), 0.0) or 0.0
+        return {"free": free, "locked": locked, "total": free + locked}
+    except Exception:
+        return {"free": 0.0, "locked": 0.0, "total": 0.0}
+
 def get_verified_bot_order_fill_qty_binance(symbol, order_id):
     """Return quantity proven to belong to the bot's own pending order.
     Never infers a fill from free balance alone, because that can be old/manual holdings.
@@ -994,8 +1008,14 @@ def handle_pending_entry(data):
     tp     = float(data["tp"])
     qty    = float(data["qty"])
     s = get_state(symbol)
-    if s["in_trade"] or s["pending"]:
-        return {"status": "ignored", "reason": "already in trade or pending"}
+    if s.get("in_trade"):
+        return {"status": "ignored", "reason": "already in trade"}
+    if s.get("pending"):
+        # New setup replaces old setup: cancel old pending, then accept the new signal.
+        _safe_cancel_pending_entry_binance(symbol, reason="REPLACED_BY_NEW_SIGNAL", exit_price=s.get("entry_price"), pnl=0.0, close_if_filled=True)
+        s = get_state(symbol)
+        if s.get("in_trade") or s.get("pending"):
+            return {"status": "ignored", "reason": "old pending not cleanly cleared; skipped new signal to stay safe"}
 
     ok_filter, filter_reason = net_profit_filter_check(entry, sl, tp, qty)
     if not ok_filter:
@@ -1425,10 +1445,24 @@ def broker_reconcile_once():
                     s.pop("unprotected_seen_ts", None)
                     save_state(symbol, s)
             if len(open_orders) == 0:
-                free_base = get_available_balance(symbol)
+                bal_parts = get_balance_parts(symbol)
+                free_base = bal_parts.get("free", 0.0)
+                locked_base = bal_parts.get("locked", 0.0)
+                total_base = bal_parts.get("total", 0.0)
 
-                # If there is free base qty, the position may be naked. Handle immediately.
-                if qty > 0 and free_base >= qty * 0.50:
+                # V31 FIX: do not mark the trade flat if Binance has the bot quantity locked
+                # inside OCO/stop orders. Free balance can be zero while the position still exists.
+                if qty > 0 and total_base >= qty * 0.50:
+                    if locked_base >= qty * 0.25 and free_base < qty * 0.50:
+                        with state_lock:
+                            s = get_state(symbol)
+                            s.pop("unprotected_seen_ts", None)
+                            s["last_reconcile_note"] = f"locked_balance_wait free={free_base} locked={locked_base} total={total_base}"
+                            save_state(symbol, s)
+                        log_action(symbol, "RECONCILE_LOCKED_BALANCE_WAIT", f"free={free_base} locked={locked_base} total={total_base}; not flat")
+                        continue
+
+                    # If there is free base qty, the position may be naked. Handle immediately.
                     if RECONCILE_UNPROTECTED_ACTION == "REPROTECT" and sl and tp:
                         oid = place_broker_exit_protection(symbol, min(qty, free_base), sl, tp)
                         if oid:
@@ -1532,12 +1566,6 @@ def monitor_pending_orders():
                 if not s.get("pending") or not s.get("buy_order_id"):
                     continue
                 try:
-                    # V28: expire stale pending broker orders if TradingView cancel was missed.
-                    if PENDING_MAX_AGE_MIN and PENDING_MAX_AGE_MIN > 0:
-                        opened = safe_dt(s.get("open_time"))
-                        if opened and (datetime.utcnow() - opened).total_seconds() > PENDING_MAX_AGE_MIN * 60:
-                            _safe_cancel_pending_entry_binance(symbol, reason="BOT_PENDING_EXPIRED", exit_price=get_current_price(symbol) or s.get("entry_price"), pnl=0.0, close_if_filled=True)
-                            continue
                     order = client.get_order(symbol=symbol, orderId=s["buy_order_id"])
                     status = order.get("status", "")
                     executed_qty = safe_float(order.get("executedQty"), 0.0) or 0.0
